@@ -6,6 +6,18 @@ import numpy as np
 import librosa
 from datetime import datetime
 
+ageFilterMappingDict = {"twenties":0,"thirties":0,"fourties":0,"fifties":0,"sixties":0,"seventies":0, "eighties":0}
+
+age_key_map = {
+    "20s": "twenties",
+    "30s": "thirties",
+    "40s": "fourties",
+    "50s": "fifties",
+    "60s": "sixties",
+    "70s": "seventies",
+    "80s": "eighties"
+}
+
 # Load the trained model for emotion detection
 with open('emotion_model.joblib', 'rb') as file:
     emotion_model = joblib.load(file)
@@ -37,6 +49,10 @@ def receive_data():
     # Age groups extraction
     age_groups = [age for age in ['20s', '30s', '40s', '50s', '60s', '70s', '80s'] if filters.get(age) == 1]
 
+    for age in age_key_map:
+        if filters.get(age) == 1:
+            ageFilterMappingDict[age_key_map[age]] = 1
+
     # Emotions extraction
     emotions_list = ['Angry', 'Sad', 'Neutral', 'Calm', 'Happy', 'Fear', 'Disgust', 'Surprised']
     emotions = [emotion for emotion in emotions_list if filters.get(emotion) == 1]
@@ -53,45 +69,6 @@ def receive_data():
         json.dump(data, file)
         print("New settings saved successfully")
     return jsonify({"status": "success", "message": "Data received and saved."})
-
-
-
-# @app.route('/upload', methods=['POST'])
-# def upload_file():
-#     print("entered upload file")
-#     if 'file' not in request.files:
-#         return 'No file part', 400
-
-#     file = request.files['file']
-#     if file.filename == '':
-#         return 'No selected file', 400
-
-#     filepath = os.path.join(UPLOAD_FOLDER, file.filename)
-#     file.save(filepath)
-#     print('before start prediction')
-#     return startPrediction(filepath)
-
-
-"""@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files:
-        return 'No file part', 400
-
-    file = request.files['file']
-    if file.filename == '':
-        return 'No selected file', 400
-    else:
-        filepath = os.path.join(UPLOAD_FOLDER, file.filename)
-        file.save(filepath)
-        print('File saved, sending dummy response')
-        return jsonify({
-            "emotion_prediction": "happy",
-            "gender_prediction": "female",
-            "age_prediction": "25",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "result": "normal"
-        })"""
-
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -120,8 +97,6 @@ def startPrediction(file_path):
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         result=check_anomaly(age_prediction,gender_prediction,emotion_prediction)
         
-        
-        #call_client()
         emotion = str(emotion_prediction[0])
         gender = str(gender_prediction[0])
         age = str(age_prediction[0])
@@ -151,17 +126,15 @@ def extract_feature(file_name, mfcc=True):
         print(f"Error processing file {file_name}: {e}")  # Debug print
         return None
         
-def check_anomaly(age_result, gender_result, emotion_result):
+def check_anomaly(age_result:str, gender_result:str, emotion_result:str):
     with open("settings.txt","r") as file:
         content:dict = json.load(file)
         filters:dict = dict(content["filters"])
-
-    if(age_result in filters.values() or gender_result in filters.values() or emotion_result in filters.values()):
+    if(filters[gender_result[0].capitalize()] == 1 or filters[emotion_result[0].capitalize()] == 1 or ageFilterMappingDict[age_result[0]] == 1):
+        print("Anomaly detected. Informing parents.")
         return "ANOMALI"
     else:
         return "NORMAL"
 
-
-    
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=12000)
