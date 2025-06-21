@@ -5,6 +5,7 @@ import joblib
 import numpy as np
 import librosa
 from datetime import datetime
+import requests
 
 ageFilterMappingDict = {"twenties":0,"thirties":0,"fourties":0,"fifties":0,"sixties":0,"seventies":0, "eighties":0}
 
@@ -88,22 +89,37 @@ def upload_file():
 def startPrediction(file_path):
     print(f"Starting prediction for: {file_path}")  # Add this
     feature = extract_feature(file_path, mfcc=True)
+
     if feature is not None:
         feature_2d = np.array([feature])  # Convert to 2D array
-        emotion_prediction = emotion_model.predict(feature_2d)
-        age_prediction = age_model.predict(feature_2d)
-        gender_prediction = gender_model.predict(feature_2d)
-        # Get current time
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        result=check_anomaly(age_prediction,gender_prediction,emotion_prediction)
-        
-        emotion = str(emotion_prediction[0])
-        gender = str(gender_prediction[0])
-        age = str(age_prediction[0])
-        
+        emotion_prediction = emotion_model.predict(feature_2d)[0]
+        age_prediction = age_model.predict(feature_2d)[0]
+        gender_prediction = gender_model.predict(feature_2d)[0]
+        current_time = datetime.now().strftime("%H:%M")
+        result = check_anomaly(age_prediction, gender_prediction, emotion_prediction)
 
-        print(f"Emotion Prediction: {emotion_prediction[0]}, Gender Prediction: {gender_prediction[0]}, Age Prediction: {age_prediction[0]}, Timestamp: {current_time}")  # Debug print
-        return jsonify({"emotion_prediction": emotion,"gender_prediction": gender,"age_prediction": age,"timestamp": current_time,"result":result})
+        # Send to your ASP.NET Core API
+        send_to_csharp_api(
+            timestamp=current_time,
+            age=age_prediction,
+            gender=gender_prediction,
+            emotion=emotion_prediction,
+            result=result,
+            file_path=file_path
+        )
+
+        with open("results.txt", "a") as f:
+            f.write(f"{current_time},{age_prediction},{gender_prediction},{emotion_prediction},{result}\n")
+
+        print(f"Emotion Prediction: {emotion_prediction}, Gender Prediction: {gender_prediction}, Age Prediction: {age_prediction}, Timestamp: {current_time}")  # Debug print
+
+        return jsonify({
+            "emotion_prediction": emotion_prediction,
+            "gender_prediction": gender_prediction,
+            "age_prediction": age_prediction,
+            "timestamp": current_time,
+            "result": result
+        })
     else:
         return jsonify({"error": "Feature extraction failed"}), 400
 
@@ -125,7 +141,29 @@ def extract_feature(file_name, mfcc=True):
     except Exception as e:
         print(f"Error processing file {file_name}: {e}")  # Debug print
         return None
-        
+
+def send_to_csharp_api(timestamp, age, gender, emotion, result, file_path):
+    url = "https://smartwatchforchildsafety-bffrfaahgtahb9bg.italynorth-01.azurewebsites.net/api/smartwatch/data"
+
+    # Format for ASP.NET Core Swagger-style form field names
+    form_data = {
+        "MetadataJson.timestamp": timestamp,
+        "MetadataJson.age_prediction": age,
+        "MetadataJson.gender_prediction": gender,
+        "MetadataJson.emotion_prediction": emotion,
+        "MetadataJson.result": result
+    }
+
+    files = {
+        "WavFile": ("audio.wav", open(file_path, "rb"), "audio/wav")
+    }
+
+    try:
+        response = requests.post(url, data=form_data, files=files)
+        print("C# API response:", response.status_code, response.text)
+    except Exception as e:
+        print("Failed to send data to C# API:", e)
+
 def check_anomaly(age_result:str, gender_result:str, emotion_result:str):
     with open("settings.txt","r") as file:
         content:dict = json.load(file)

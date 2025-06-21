@@ -8,7 +8,8 @@
 void ui_PredictionsPage_screen_init(void)
 {
     ui_PredictionsPage = lv_obj_create(NULL);
-    lv_obj_clear_flag(ui_PredictionsPage, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+    //lv_obj_clear_flag(ui_PredictionsPage, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+    lv_obj_add_flag(ui_PredictionsPage, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(ui_PredictionsPage, lv_color_hex(0xE6E6FA), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(ui_PredictionsPage, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
 
@@ -19,7 +20,10 @@ void ui_PredictionsPage_screen_init(void)
     lv_obj_set_align(ui_PredictionTable, LV_ALIGN_CENTER);
     lv_obj_set_flex_flow(ui_PredictionTable, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(ui_PredictionTable, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(ui_PredictionTable, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+    lv_obj_set_scrollbar_mode(ui_PredictionTable, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_scroll_dir(ui_PredictionTable, LV_DIR_VER);
+    lv_obj_clear_flag(ui_PredictionTable, LV_OBJ_FLAG_CLICKABLE);      /// Flags
+    lv_obj_add_flag(ui_PredictionTable, LV_OBJ_FLAG_SCROLLABLE);
 
     ui_PredictionTableHeaderRow = lv_obj_create(ui_PredictionTable);
     lv_obj_remove_style_all(ui_PredictionTableHeaderRow);

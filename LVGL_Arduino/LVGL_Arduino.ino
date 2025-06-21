@@ -2,14 +2,11 @@
  *Be sure to read the docs here: https://docs.lvgl.io/master/get-started/platforms/arduino.html  */
 
 #include "Display_SPD2010.h"
-#include "Audio_PCM5101.h"
 #include "RTC_PCF85063.h"
 #include "Gyro_QMI8658.h"
 #include "LVGL_Driver.h"
-//#include "MIC_MSM.h"
 #include "PWR_Key.h"
 #include "SD_Card.h"
-#include "LVGL_Example.h"
 #include "BAT_Driver.h"
 #include "ui.h"
 #include <WiFi.h>
@@ -17,21 +14,20 @@
 #include "esp_psram.h"
 #include "esp_heap_caps.h"
 #include <time.h>
-#include "ESP_I2S.h"
+#include "driver/i2s.h"
 #include <ArduinoJson.h>
 
-#define SAMPLE_RATE      44100
-#define BITS_PER_SAMPLE  24        // Actual sample precision saved to file
-#define CHANNELS         1         // Mono
+#define SAMPLE_RATE      16000
+#define BITS_PER_SAMPLE  16        // Actual sample precision saved to file
+#define CHANNELS         1         //Mono
 #define RECORD_TIME_SEC  10        // 10-second recording
 #define BUFFER_SIZE 1024
 
+#define I2S_PORT      I2S_NUM_0
 #define I2S_PIN_BCK   15
 #define I2S_PIN_WS    2
 #define I2S_PIN_DOUT  -1    // Not used for recording
 #define I2S_PIN_DIN   39    // Microphone data input
-
-I2SClass i2s;
 
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3 * 3600;  //UTC+3
@@ -150,7 +146,7 @@ void recordAudio() {
                     String(datetime.second) + ".wav";
 
   uint32_t totalSamples = SAMPLE_RATE * RECORD_TIME_SEC;
-  uint32_t dataSize = totalSamples * 3;  // 24-bit = 3 bytes/sample
+  uint32_t dataSize = totalSamples * 2; // Mono 16-bit
 
   File wavFile = SD_MMC.open(filename.c_str(), FILE_WRITE);
   if (!wavFile) {
@@ -160,77 +156,70 @@ void recordAudio() {
 
   writeWavHeader(wavFile, SAMPLE_RATE, BITS_PER_SAMPLE, CHANNELS, dataSize);
 
-  i2s_chan_handle_t rx_handle = i2s.rxChan();
-  if (!rx_handle) {
-    Serial.println("ERROR: RX channel handle is NULL");
-    wavFile.close();
-    return;
-  }
-
-  i2s_channel_disable(rx_handle);
-  vTaskDelay(pdMS_TO_TICKS(100));
-  if (i2s_channel_enable(rx_handle) != ESP_OK) {
-    Serial.println("ERROR: Failed to enable I2S channel");
-    wavFile.close();
-    return;
-  }
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  const size_t bufferSize = BUFFER_SIZE * 4; // 32-bit samples
-  uint8_t* buffer = (uint8_t*)malloc(bufferSize);
-  if (!buffer) {
+  const size_t bufferSize = BUFFER_SIZE * 4;
+  uint8_t* stereoBuffer = (uint8_t*)malloc(bufferSize);
+  uint8_t* monoBuffer = (uint8_t*)malloc(bufferSize / 2);
+  
+  if (!stereoBuffer || !monoBuffer) {
     Serial.println("ERROR: Failed to allocate recording buffer");
+    if (stereoBuffer) free(stereoBuffer);
+    if (monoBuffer) free(monoBuffer);
     wavFile.close();
     return;
   }
-  Serial.printf("Recording at %d Hz, %d-bit, %s\n",
-              i2s.rxSampleRate(),
-              (int)i2s.rxDataWidth(),
-              i2s.rxSlotMode() == I2S_SLOT_MODE_MONO ? "Mono" : "Stereo");
+
   Serial.println("Recording...");
-  uint32_t totalBytesWritten = 0;
+  size_t totalBytesWritten = 0;
+  bool firstBuffer = true;
 
   while (totalBytesWritten < dataSize) {
-    size_t bytesToRead = min((size_t)(dataSize - totalBytesWritten) * 4 / 3, bufferSize);
+    size_t bytesToRead = min((size_t)((dataSize - totalBytesWritten) * 2), bufferSize);
     size_t bytesRead = 0;
 
-    esp_err_t err = i2s_channel_read(rx_handle, buffer, bytesToRead, &bytesRead, pdMS_TO_TICKS(1000));
+    esp_err_t err = i2s_read(I2S_PORT, stereoBuffer, bytesToRead, &bytesRead, pdMS_TO_TICKS(1000));
     if (err != ESP_OK || bytesRead == 0) {
-      Serial.println("ERROR: I2S read failed");
+      Serial.printf("ERROR: I2S read failed: %s\n", esp_err_to_name(err));
       break;
     }
 
-    int32_t* samples = (int32_t*)buffer;
-    size_t sampleCount = bytesRead / 4;
-
-    for (size_t i = 0; i < sampleCount && totalBytesWritten < dataSize; ++i) {
-      int32_t sample = samples[i];
-      uint8_t pcm24[3];
-      pcm24[0] = (sample >> 8) & 0xFF;
-      pcm24[1] = (sample >> 16) & 0xFF;
-      pcm24[2] = (sample >> 24) & 0xFF;
-      wavFile.write(pcm24, 3);
-      totalBytesWritten += 3;
+    // Debug: Check first buffer for audio data
+    if (firstBuffer && bytesRead >= 16) {
+      int16_t* samples = (int16_t*)stereoBuffer;
+      Serial.println("First 8 samples (L/R pairs):");
+      for (int i = 0; i < 8; i += 2) {
+        Serial.printf("  L: %d, R: %d\n", samples[i], samples[i+1]);
+      }
+      firstBuffer = false;
     }
+
+    // Convert stereo to mono - try RIGHT channel instead of left
+    int16_t* stereoSamples = (int16_t*)stereoBuffer;
+    int16_t* monoSamples = (int16_t*)monoBuffer;
+    size_t stereoSampleCount = bytesRead / 4;
+    
+    for (size_t i = 0; i < stereoSampleCount; i++) {
+      monoSamples[i] = stereoSamples[i * 2 + 1]; // RIGHT channel (changed from i*2 to i*2+1)
+    }
+    
+    size_t monoBytesToWrite = stereoSampleCount * 2;
+    wavFile.write(monoBuffer, monoBytesToWrite);
+    totalBytesWritten += monoBytesToWrite;
   }
 
-  i2s_channel_disable(rx_handle);
-  free(buffer);
+  free(stereoBuffer);
+  free(monoBuffer);
   wavFile.close();
 
-  // Verify file was created
   File testFile = SD_MMC.open(filename.c_str(), FILE_READ);
   if (testFile) {
     size_t fileSize = testFile.size();
     testFile.close();
     Serial.printf("WAV file created: %s (%d bytes)\n", filename.c_str(), fileSize);
-    
-    // Copy to the expected filename for upload
+
     if (SD_MMC.exists("/myfile.wav")) {
       SD_MMC.remove("/myfile.wav");
     }
-    
-    // Simple file copy
+
     File source = SD_MMC.open(filename.c_str(), FILE_READ);
     File dest = SD_MMC.open("/myfile.wav", FILE_WRITE);
     if (source && dest) {
@@ -378,255 +367,6 @@ if (!file) {
 
 }
 
-// Add this function to analyze the recorded audio data
-void analyzeAudioData() {
-  File wavFile = SD_MMC.open("/myfile.wav", FILE_READ);
-  if (!wavFile) {
-    Serial.println("ERROR: Cannot open WAV file for analysis");
-    return;
-  }
-
-  size_t fileSize = wavFile.size();
-  Serial.printf("=== Audio Analysis ===\n");
-  Serial.printf("File size: %d bytes\n", fileSize);
-
-  if (fileSize <= 44) {
-    Serial.println("File only contains WAV header, no audio data");
-    wavFile.close();
-    return;
-  }
-
-  // Skip WAV header (44 bytes)
-  wavFile.seek(44);
-  
-  // Read first 1000 samples (2000 bytes for 16-bit)
-  const int samplesToAnalyze = 1000;
-  int16_t samples[samplesToAnalyze];
-  size_t bytesRead = wavFile.read((uint8_t*)samples, samplesToAnalyze * 2);
-  
-  if (bytesRead == 0) {
-    Serial.println("No audio data found after header");
-    wavFile.close();
-    return;
-  }
-
-  // Analyze the samples
-  int16_t minVal = 32767, maxVal = -32768;
-  int32_t sum = 0;
-  int nonZeroCount = 0;
-  int zeroCount = 0;
-
-  for (int i = 0; i < bytesRead / 2; i++) {
-    int16_t sample = samples[i];
-    
-    if (sample != 0) {
-      nonZeroCount++;
-      if (sample < minVal) minVal = sample;
-      if (sample > maxVal) maxVal = sample;
-    } else {
-      zeroCount++;
-    }
-    
-    sum += abs(sample);
-  }
-
-  float avgAmplitude = (float)sum / (bytesRead / 2);
-  
-  Serial.printf("Samples analyzed: %d\n", bytesRead / 2);
-  Serial.printf("Zero samples: %d\n", zeroCount);
-  Serial.printf("Non-zero samples: %d\n", nonZeroCount);
-  Serial.printf("Min value: %d\n", minVal);
-  Serial.printf("Max value: %d\n", maxVal);
-  Serial.printf("Average amplitude: %.2f\n", avgAmplitude);
-  
-  // Print first 20 samples as hex and decimal
-  Serial.println("First 20 samples (hex | decimal):");
-  for (int i = 0; i < min(20, (int)(bytesRead / 2)); i++) {
-    Serial.printf("  %04X | %6d\n", (uint16_t)samples[i], samples[i]);
-  }
-
-  // Check if data looks like valid audio
-  if (zeroCount == bytesRead / 2) {
-    Serial.println("*** ALL SAMPLES ARE ZERO - No audio signal ***");
-  } else if (nonZeroCount < (bytesRead / 20)) {
-    Serial.println("*** VERY FEW NON-ZERO SAMPLES - Weak or no signal ***");
-  } else if (maxVal - minVal < 100) {
-    Serial.println("*** VERY LOW DYNAMIC RANGE - Signal may be too quiet ***");
-  } else {
-    Serial.println("Audio data appears to contain signal");
-  }
-
-  wavFile.close();
-}
-
-// Test function to check I2S data in real-time
-void testI2SDataLive() {
-  Serial.println("=== Live I2S Data Test ===");
-  
-  i2s_chan_handle_t rx_handle = i2s.rxChan();
-  if (!rx_handle) {
-    Serial.println("ERROR: RX handle is NULL");
-    return;
-  }
-
-  // Reset channel state
-  i2s_channel_disable(rx_handle);
-  vTaskDelay(pdMS_TO_TICKS(100));
-  esp_err_t err = i2s_channel_enable(rx_handle);
-  if (err != ESP_OK) {
-    Serial.printf("ERROR: Cannot enable channel: %s\n", esp_err_to_name(err));
-    return;
-  }
-
-  vTaskDelay(pdMS_TO_TICKS(100)); // Let channel settle
-
-  const int testSamples = 100;
-  int16_t buffer[testSamples];
-  
-  Serial.println("Reading live data for 5 seconds...");
-  for (int test = 0; test < 5; test++) {
-    size_t bytesRead = 0;
-    err = i2s_channel_read(rx_handle, (uint8_t*)buffer, testSamples * 2, &bytesRead, pdMS_TO_TICKS(1000));
-    
-    if (err != ESP_OK) {
-      Serial.printf("Read error: %s\n", esp_err_to_name(err));
-      continue;
-    }
-
-    if (bytesRead == 0) {
-      Serial.println("No data read");
-      continue;
-    }
-
-    // Analyze this chunk
-    int16_t minVal = 32767, maxVal = -32768;
-    int nonZero = 0;
-    for (int i = 0; i < bytesRead / 2; i++) {
-      if (buffer[i] != 0) {
-        nonZero++;
-        if (buffer[i] < minVal) minVal = buffer[i];
-        if (buffer[i] > maxVal) maxVal = buffer[i];
-      }
-    }
-
-    Serial.printf("Test %d: %d bytes, %d non-zero, range %d to %d | First few: ", 
-                  test + 1, bytesRead, nonZero, minVal, maxVal);
-    
-    for (int i = 0; i < min(5, (int)(bytesRead / 2)); i++) {
-      Serial.printf("%d ", buffer[i]);
-    }
-    Serial.println();
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
-  }
-
-  i2s_channel_disable(rx_handle);
-  Serial.println("Live test complete");
-}
-
-// Test different I2S configurations
-void testI2SConfigurations() {
-  Serial.println("=== Testing I2S Configurations ===");
-  
-  // Test 1: Current configuration
-  Serial.println("Test 1: Current configuration (MONO, 16-bit, 16kHz)");
-  testI2SDataLive();
-  
-  // Test 2: Try stereo mode
-  Serial.println("\nTest 2: Trying STEREO mode");
-  i2s.end();
-  vTaskDelay(pdMS_TO_TICKS(500));
-  
-  i2s.setPins(I2S_PIN_BCK, I2S_PIN_WS, I2S_PIN_DOUT, I2S_PIN_DIN);
-  bool success = i2s.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
-  if (success) {
-    success = i2s.configureRX(SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO, I2S_RX_TRANSFORM_NONE);
-    if (success) {
-      testI2SDataLive();
-    } else {
-      Serial.println("Failed to configure RX in stereo mode");
-    }
-  } else {
-    Serial.println("Failed to begin I2S in stereo mode");
-  }
-  
-  // Restore original configuration
-  Serial.println("\nRestoring original configuration");
-  setupI2S();
-}
-
-// Enhanced microphone test with different settings
-void testMicrophoneSettings() {
-  Serial.println("=== Microphone Settings Test ===");
-  
-  // Test with different bit depths and sample rates
-  struct TestConfig {
-    uint32_t sampleRate;
-    i2s_data_bit_width_t bitWidth;
-    const char* description;
-  };
-  
-  TestConfig configs[] = {
-    {8000, I2S_DATA_BIT_WIDTH_16BIT, "8kHz 16-bit"},
-    {16000, I2S_DATA_BIT_WIDTH_16BIT, "16kHz 16-bit"},
-    {44100, I2S_DATA_BIT_WIDTH_16BIT, "44.1kHz 16-bit"},
-    {16000, I2S_DATA_BIT_WIDTH_32BIT, "16kHz 32-bit"}
-  };
-  
-  for (int i = 0; i < 4; i++) {
-    Serial.printf("\nTesting: %s\n", configs[i].description);
-    
-    i2s.end();
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    i2s.setPins(I2S_PIN_BCK, I2S_PIN_WS, I2S_PIN_DOUT, I2S_PIN_DIN);
-    bool success = i2s.begin(I2S_MODE_STD, configs[i].sampleRate, configs[i].bitWidth, I2S_SLOT_MODE_MONO);
-    
-    if (success) {
-      success = i2s.configureRX(configs[i].sampleRate, configs[i].bitWidth, I2S_SLOT_MODE_MONO, I2S_RX_TRANSFORM_NONE);
-      if (success) {
-        // Quick test read
-        i2s_chan_handle_t rx_handle = i2s.rxChan();
-        if (rx_handle) {
-          i2s_channel_disable(rx_handle);
-          vTaskDelay(pdMS_TO_TICKS(50));
-          if (i2s_channel_enable(rx_handle) == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            
-            uint8_t buffer[1024];
-            size_t bytesRead;
-            esp_err_t err = i2s_channel_read(rx_handle, buffer, 1024, &bytesRead, pdMS_TO_TICKS(1000));
-            
-            Serial.printf("  Result: %s, bytes: %d\n", esp_err_to_name(err), bytesRead);
-            
-            if (bytesRead > 0 && configs[i].bitWidth == I2S_DATA_BIT_WIDTH_16BIT) {
-              int16_t* samples = (int16_t*)buffer;
-              int nonZero = 0;
-              for (int j = 0; j < bytesRead / 2; j++) {
-                if (samples[j] != 0) nonZero++;
-              }
-              Serial.printf("  Non-zero samples: %d/%d\n", nonZero, bytesRead / 2);
-            }
-            
-            i2s_channel_disable(rx_handle);
-          }
-        }
-      } else {
-        Serial.println("  Failed to configure RX");
-      }
-    } else {
-      Serial.println("  Failed to begin I2S");
-    }
-  }
-  
-  // Restore original setup
-  Serial.println("\nRestoring original configuration");
-  setupI2S();
-}
-
-
-
-
 bool readCredentials(String& primary, String& secondary) {
   File file = SD_MMC.open("/credentials.txt", FILE_READ);
   if (!file) {
@@ -732,43 +472,6 @@ void sendConfig() {
   }
 }
 
-void sendDataTask(void* pvParameters) {
-  while (1) {
-    if (WiFi.status() == WL_CONNECTED) {
-      String primary, secondary;
-      if (!readCredentials(primary, secondary)) return;
-
-      String filtersJson = readFilteringConfigJSON();
-
-      // Construct JSON payload
-      String payload = "{";
-      payload += "\"primaryPhone\":\"" + primary + "\",";
-      payload += "\"secondaryPhone\":\"" + secondary + "\",";
-      payload += filtersJson;
-      payload += "}";
-
-      WiFiClient client;
-      HTTPClient http;
-      String url = "http://" + WiFi.gatewayIP().toString() + ":12000" + ROUTE;
-      http.begin(client, url.c_str());
-      http.addHeader("Content-Type", "application/json");
-      Serial.printf("Target URL: %s\n", url.c_str());
-
-      int code = http.POST(payload);
-
-      Serial.printf("[HTTP] POST code: %d\n", code);
-      if (code > 0)
-        Serial.println(http.getString());
-
-      http.end();  // VERY important!
-    } else {
-      Serial.println("WiFi not connected.");
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(5000));  // for debugging, reduce interval
-  }
-}
-
 void configWatcherTask(void* param) {
   while (1) {
     File f = SD_MMC.open("/samplingRateConfig.txt", FILE_READ);
@@ -778,6 +481,7 @@ void configWatcherTask(void* param) {
         Serial.println("Detected change in samplingRateConfig.txt.");
         lastFileHash = currentHash;
         RestartDynamicRecordingTask();
+        sendConfig();
       }
       f.close();
     } else {
@@ -817,75 +521,81 @@ void rtcDriverTask(void* param) {
   }
 }
 
+void FileMaintenanceTask(void *param) {
+  while (true) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      if (timeinfo.tm_hour == 0 && timeinfo.tm_min == 0) {
+        if (SD_MMC.exists("/results.txt")) {
+          SD_MMC.remove("/results.txt");
+          Serial.println(">> /results.txt deleted at midnight.");
+
+          // Recreate an empty file
+          File f = SD_MMC.open("/results.txt", FILE_WRITE);
+          if (f) {
+            f.close();
+            Serial.println(">> /results.txt recreated as empty file.");
+          } else {
+            Serial.println("!! Failed to recreate /results.txt");
+          }
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(3600000));  // Wait 1 hour
+  }
+}
+
 void setupI2S() {
-  Serial.println("=== I2S Setup ===");
+  Serial.println("Setting up I2S...");
   
-  // Configure I2S pins
-  i2s.setPins(I2S_PIN_BCK, I2S_PIN_WS, I2S_PIN_DOUT, I2S_PIN_DIN);
-  i2s.setTimeout(1000);
+  // Print pin assignments
+  Serial.printf("I2S Pin Configuration:\n");
+  Serial.printf("  BCK (Clock): GPIO %d\n", I2S_PIN_BCK);
+  Serial.printf("  WS (Word Select): GPIO %d\n", I2S_PIN_WS);
+  Serial.printf("  DIN (Data In): GPIO %d\n", I2S_PIN_DIN);
 
-  // Initialize I2S in standard mode for recording
-  bool success = i2s.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
-  if (!success) {
-    Serial.println("ERROR: I2S begin failed!");
-    Serial.printf("Last I2S error: %d\n", i2s.lastError());
-    while (1) {
-      delay(1000);
-      Serial.println("I2S initialization failed - system halted");
-    }
-  }
-  
-  Serial.println("I2S begin successful");
+  const i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 512,
+    .use_apll = true,  // Enable APLL for precise clock
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
 
-  // Configure RX channel for recording
-  success = i2s.configureRX(SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO, I2S_RX_TRANSFORM_NONE);
-  if (!success) {
-    Serial.println("ERROR: I2S configureRX failed!");
-    Serial.printf("Last I2S error: %d\n", i2s.lastError());
-    while (1) {
-      delay(1000);
-      Serial.println("I2S RX configuration failed - system halted");
-    }
-  }
-  
-  Serial.println("I2S RX configuration successful");
+  const i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_PIN_BCK,
+    .ws_io_num = I2S_PIN_WS,
+    .data_out_num = I2S_PIN_DOUT,
+    .data_in_num = I2S_PIN_DIN
+  };
 
-  // Verify RX channel handle exists
-  i2s_chan_handle_t rx_handle = i2s.rxChan();
-  if (!rx_handle) {
-    Serial.println("ERROR: RX channel handle is NULL after configuration.");
-    while (1) {
-      delay(1000);
-      Serial.println("I2S RX handle NULL - system halted");
-    }
+  esp_err_t result = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  if (result != ESP_OK) {
+    Serial.printf("ERROR: I2S driver install failed: %s\n", esp_err_to_name(result));
+    return;
   }
   
-  Serial.printf("I2S RX Handle: %p\n", rx_handle);
-  
-  // Ensure channel starts in disabled state
-  esp_err_t err = i2s_channel_disable(rx_handle);
-  Serial.printf("Initial channel disable: %s\n", esp_err_to_name(err));
-  
-  // Brief delay
-  vTaskDelay(pdMS_TO_TICKS(50));
-  
-  // Test enable/disable cycle
-  err = i2s_channel_enable(rx_handle);
-  if (err == ESP_OK) {
-    Serial.println("I2S channel test enable successful");
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    err = i2s_channel_disable(rx_handle);
-    Serial.printf("I2S channel test disable: %s\n", esp_err_to_name(err));
-  } else {
-    Serial.printf("WARNING: I2S channel enable test failed: %s\n", esp_err_to_name(err));
+  result = i2s_set_pin(I2S_PORT, &pin_config);
+  if (result != ESP_OK) {
+    Serial.printf("ERROR: I2S pin config failed: %s\n", esp_err_to_name(result));
+    return;
   }
-  
+
   Serial.println("I2S setup complete - ready for recording");
-  Serial.printf("I2S Target Sample Rate: %d Hz\n", SAMPLE_RATE);
-  Serial.printf("I2S Actual RX Sample Rate: %f Hz\n", i2s.rxSampleRate());
-  Serial.printf("I2S Actual RX Bit Width: %d-bit\n", (int)i2s.rxDataWidth());
-  Serial.printf("I2S Actual RX Slot Mode: %s\n", i2s.rxSlotMode() == I2S_SLOT_MODE_MONO ? "Mono" : "Stereo");
+  
+  // Critical: Check if actual rate matches target
+  float actual_rate = 0;
+  actual_rate = i2s_get_clk(I2S_PORT);
+  Serial.printf("Target: %d Hz, Actual: %f Hz\n", SAMPLE_RATE, actual_rate);
+  
+  float ratio = (float)SAMPLE_RATE / actual_rate;
+  Serial.printf("Rate ratio: %.3f (should be close to 1.0)\n", ratio);
 }
 
 void Driver_Init() {
@@ -926,7 +636,7 @@ void setup() {
     PCF85063_Set_All(datetime);
     Serial.println("RTC set from NTP and global datetime updated.");
   }
-
+  
   Driver_Init();
   setupI2S();
   SD_Init();
@@ -936,6 +646,9 @@ void setup() {
   if (f) {
     lastFileHash = calculateFileCRC32(f);
     f.close();
+  }
+  if (SD_MMC.exists("/results.txt")) {
+    SD_MMC.remove("/results.txt");
   }
   sendConfig();
   RestartDynamicRecordingTask();
@@ -958,6 +671,16 @@ void setup() {
     1,
     NULL,
     0  // Core 0
+  );
+
+  xTaskCreatePinnedToCore(
+    FileMaintenanceTask,
+    "HourlyFileCheck",
+    2048,
+    NULL,
+    1,
+    NULL,
+    0  // Core 0 (or 1 if Core 0 is too busy)
   );
 }
 void loop() {

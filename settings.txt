@@ -1,0 +1,1 @@
+{"primaryPhone": "0533867923", "secondaryPhone": "0533867923", "filters": {"Male": 1, "Female": 0, "Angry": 1, "Sad": 1, "Neutral": 0, "Calm": 1, "Happy": 0, "Fear": 1, "Disgust": 0, "Surprised": 0, "20s": 1, "30s": 0, "40s": 0, "50s": 0, "60s": 0, "70s": 0, "80s": 0}}
